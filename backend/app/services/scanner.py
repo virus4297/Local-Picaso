@@ -2,10 +2,12 @@ import os
 import time
 import logging
 import traceback
+from app.services.processor import process_photos
 from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
 from sqlmodel import Session, select
 from app.main import engine, Photo
+from threading import Lock
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scanner")
@@ -54,35 +56,71 @@ class PhotoHandler(FileSystemEventHandler):
                     session.add(new_photo)
                     session.commit()
                     logger.info(f"Indexed new photo: {new_photo.filename}")
+                    
+                    # TRIGGER THE PROCESSOR HERE
+                    process_photos()
+
         except Exception:
             logger.exception("Failed to process photo")
 
+pending_sizes: dict[str, int] = {}
+pending_lock = Lock()
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "5"))
+
 def scan_directory(path_to_watch):
     try:
+        with Session(engine) as session:
+            # get scalar file_path values from the query
+            existing = set(session.exec(select(Photo.file_path)).all())
+
         for root, _, files in os.walk(path_to_watch):
             for f in files:
-                if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    PhotoHandler().process_new_photo(os.path.join(root, f))
+                if not f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    continue
+                full = os.path.join(root, f)
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    continue
+
+                if full in existing:
+                    with pending_lock:
+                        pending_sizes.pop(full, None)
+                    continue
+
+                with pending_lock:
+                    prev = pending_sizes.get(full)
+                    if prev is None:
+                        pending_sizes[full] = size
+                        continue  # first observation, wait for next scan
+                    if prev != size:
+                        pending_sizes[full] = size
+                        continue  # size changed, wait for stabilization
+                    # size stable across two scans — process it
+                    pending_sizes.pop(full, None)
+
+                PhotoHandler().process_new_photo(full)
     except Exception:
-        logger.exception("Error during directory scan")
+        logger.exception("Error during full directory scan")
 
 def start_scanner(path_to_watch):
+    # ensure directory exists before scheduling observer
+    if not os.path.exists(path_to_watch):
+        os.makedirs(path_to_watch, exist_ok=True)
+
     event_handler = PhotoHandler()
     observer = PollingObserver(timeout=1)
     observer.schedule(event_handler, path_to_watch, recursive=True)
     observer.start()
     logger.info(f"Watcher started on: {path_to_watch}")
 
-    if not os.path.exists(path_to_watch):
-        os.makedirs(path_to_watch, exist_ok=True)
-
     # Initial full scan
     scan_directory(path_to_watch)
 
     try:
         while True:
-            scan_directory(path_to_watch)  # periodic catch-all
-            time.sleep(5)
+            scan_directory(path_to_watch)  # use SCAN_INTERVAL
+            time.sleep(SCAN_INTERVAL)
     except KeyboardInterrupt:
         observer.stop()
     except Exception:

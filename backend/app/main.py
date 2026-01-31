@@ -28,7 +28,7 @@ class Photo(SQLModel, table=True):
 # 3. The Lifespan (The most important part)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 LocalVision Engine is initializing...")
+    print("LocalVision Engine is initializing...")
     SQLModel.metadata.create_all(engine)
 
     from app.services.scanner import start_scanner
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     scanner_thread.start()
 
     yield
-    print("🛑 LocalVision Engine is shutting down...")
+    print("LocalVision Engine is shutting down...")
 
 # 4. Define the App ONLY ONCE
 app = FastAPI(title="LocalVision API", lifespan=lifespan)

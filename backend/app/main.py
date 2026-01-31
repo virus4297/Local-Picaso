@@ -2,7 +2,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from typing import Optional
-
+from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI
 from sqlmodel import Field, SQLModel, create_engine, Session
 from sqlalchemy import event
@@ -60,3 +60,27 @@ def get_photos():
     with Session(engine) as session:
         from sqlmodel import select
         return session.exec(select(Photo)).all()
+    
+# 5. Static Files Serving
+# This lets you go to http://localhost:8000/content/thumbnails/your_image.jpg
+app.mount("/content/photos", StaticFiles(directory="/app/data/photos"), name="photos")
+app.mount("/content/thumbs", StaticFiles(directory="/app/data/thumbnails"), name="thumbnails")
+
+@app.get("/gallery")
+def get_gallery():
+    with Session(engine) as session:
+        from sqlmodel import select
+        # Only show photos that are successfully processed
+        statement = select(Photo).where(Photo.status == "processed")
+        photos = session.exec(statement).all()
+        
+        # We transform the data to include the URL for the frontend
+        return [
+            {
+                "id": p.id,
+                "filename": p.filename,
+                "full_url": f"/content/photos/{p.filename}",
+                "thumb_url": f"/content/thumbs/thumb_{p.id}_{p.filename}"
+            }
+            for p in photos
+        ]

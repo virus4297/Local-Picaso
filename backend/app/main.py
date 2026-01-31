@@ -19,11 +19,30 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.close()
 
 # 2. Database Model
+# --- MODELS ---
+class Person(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = "Unknown"
+
+class Face(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    photo_id: int = Field(foreign_key="photo.id")
+    person_id: Optional[int] = Field(default=None, foreign_key="person.id")
+    
+    # Coordinates for the specific face crop
+    box_x: int
+    box_y: int
+    box_w: int
+    box_h: int
+    
+    # The mathematical fingerprint
+    encoding: str 
+
 class Photo(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     file_path: str = Field(unique=True)
     filename: str
-    status: str = "pending"
+    status: str = "pending" # pending, processed, error
 
 # 3. The Lifespan (The most important part)
 @asynccontextmanager
@@ -61,11 +80,35 @@ def get_photos():
         from sqlmodel import select
         return session.exec(select(Photo)).all()
     
+os.makedirs("/app/data/photos", exist_ok=True)
+os.makedirs("/app/data/thumbnails", exist_ok=True)
+os.makedirs("/app/data/faces", exist_ok=True) # This is the one causing the crash!
+
+# 3. Now you can safely mount them
+app.mount("/content/photos", StaticFiles(directory="/app/data/photos"), name="photos")
+app.mount("/content/thumbs", StaticFiles(directory="/app/data/thumbnails"), name="thumbnails")
+app.mount("/content/faces", StaticFiles(directory="/app/data/faces"), name="faces")
+
 # 5. Static Files Serving
 # This lets you go to http://localhost:8000/content/thumbnails/your_image.jpg
 app.mount("/content/photos", StaticFiles(directory="/app/data/photos"), name="photos")
 app.mount("/content/thumbs", StaticFiles(directory="/app/data/thumbnails"), name="thumbnails")
+app.mount("/content/faces", StaticFiles(directory="/app/data/faces"), name="faces")
 
+@app.get("/people")
+def get_people_gallery():
+    """Returns a list of all detected face crops."""
+    with Session(engine) as session:
+        faces = session.exec(select(Face)).all()
+        return [
+            {
+                "face_id": f.id,
+                "photo_id": f.photo_id,
+                "url": f"/content/faces/face_{f.id}.jpg"
+            }
+            for f in faces
+        ]
+    
 @app.get("/gallery")
 def get_gallery():
     with Session(engine) as session:
@@ -84,3 +127,11 @@ def get_gallery():
             }
             for p in photos
         ]
+    
+@app.get("/faces")
+def get_faces():
+    with Session(engine) as session:
+        from sqlmodel import select
+        # This queries the Face table we created
+        faces = session.exec(select(Face)).all()
+        return faces

@@ -5,3 +5,7 @@ pillow
 watchdog
 python-multipart
 sqlmodel
+mediapipe
+scikit-learn
+opencv-python-headless
+numpy

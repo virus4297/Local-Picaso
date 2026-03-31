@@ -9,3 +9,4 @@ mediapipe
 scikit-learn
 opencv-python-headless
 numpy
+deepface

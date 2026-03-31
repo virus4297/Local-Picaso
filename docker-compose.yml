@@ -3,6 +3,16 @@ services:
     build: ./backend
     volumes:
       - ./backend:/app
+      - ./frontend:/app/frontend
       - ./data:/app/data
     ports:
       - "8000:8000"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    depends_on:
+      - backend
+    command: tunnel --url http://backend:8000
+    restart: unless-stopped
+    volumes:
+      - ./cloudflared:/etc/cloudflared

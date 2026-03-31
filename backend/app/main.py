@@ -1,14 +1,18 @@
 import os
 import threading
+from fastapi.middleware.cors import CORSMiddleware
+
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
+
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi import FastAPI
-from sqlmodel import Field, SQLModel, create_engine, Session
+from pydantic import BaseModel
+from sqlmodel import Field, SQLModel, create_engine, Session, select
 from sqlalchemy import event
 
-# 1. Database Configuration
-DATABASE_URL = "sqlite:///./data/localvision.db"
+# 1. Database Configuration (Using Absolute Path for Docker Stability)
+DATABASE_URL = "sqlite:////app/data/localvision.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
 @event.listens_for(engine, "connect")
@@ -18,8 +22,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
-# 2. Database Model
-# --- MODELS ---
+# 2. Database Models
 class Person(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = "Unknown"
@@ -28,96 +31,130 @@ class Face(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     photo_id: int = Field(foreign_key="photo.id")
     person_id: Optional[int] = Field(default=None, foreign_key="person.id")
-    
-    # Coordinates for the specific face crop
     box_x: int
     box_y: int
     box_w: int
     box_h: int
-    
-    # The mathematical fingerprint
-    encoding: str 
+    encoding: str = "[]"
 
 class Photo(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     file_path: str = Field(unique=True)
     filename: str
-    status: str = "pending" # pending, processed, error
+    status: str = "pending" # pending, processing, processed, error
 
-# 3. The Lifespan (The most important part)
+# 3. Lifespan (Startup/Shutdown)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("LocalVision Engine is initializing...")
+    # Ensure directories exist BEFORE creating DB or starting scanner
+    os.makedirs("/app/data/photos", exist_ok=True)
+    os.makedirs("/app/data/thumbnails", exist_ok=True)
+    os.makedirs("/app/data/faces", exist_ok=True)
+    
     SQLModel.metadata.create_all(engine)
 
     from app.services.scanner import start_scanner
-    watch_path = os.environ.get("WATCH_PATH")
-    if not watch_path:
-        if os.path.exists("/app/data/photos"):
-            watch_path = "/app/data/photos"
-        else:
-            watch_path = os.path.abspath(os.path.join(os.getcwd(), "data", "photos"))
-
-    os.makedirs(watch_path, exist_ok=True)
+    watch_path = "/app/data/photos"
+    
     print(f"Starting scanner watching: {watch_path}")
-
     scanner_thread = threading.Thread(target=start_scanner, args=(watch_path,), daemon=True)
     scanner_thread.start()
 
     yield
     print("LocalVision Engine is shutting down...")
 
-# 4. Define the App ONLY ONCE
+# 4. App Definition
 app = FastAPI(title="LocalVision API", lifespan=lifespan)
 
+# Static File Mounting (Done once, safely)
+app.mount("/content/photos", StaticFiles(directory="/app/data/photos"), name="photos")
+app.mount("/content/thumbs", StaticFiles(directory="/app/data/thumbnails"), name="thumbnails")
+app.mount("/content/faces", StaticFiles(directory="/app/data/faces"), name="faces")
+app.mount("/ui", StaticFiles(directory="/app/frontend"), name="frontend")
+
+# 5. API Models
+class PersonNameUpdate(BaseModel):
+    name: str
+
+# 6. Endpoints
 @app.get("/")
 def root():
-    return {"status": "online", "message": "Everything is working!"}
+    return {
+        "status": "online",
+        "message": "LocalVision is running!",
+        "ui": "/ui/index.html"
+    }
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # This allows your index.html to "talk" to the Pi
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/photos")
 def get_photos():
     with Session(engine) as session:
-        from sqlmodel import select
         return session.exec(select(Photo)).all()
-    
-os.makedirs("/app/data/photos", exist_ok=True)
-os.makedirs("/app/data/thumbnails", exist_ok=True)
-os.makedirs("/app/data/faces", exist_ok=True) # This is the one causing the crash!
-
-# 3. Now you can safely mount them
-app.mount("/content/photos", StaticFiles(directory="/app/data/photos"), name="photos")
-app.mount("/content/thumbs", StaticFiles(directory="/app/data/thumbnails"), name="thumbnails")
-app.mount("/content/faces", StaticFiles(directory="/app/data/faces"), name="faces")
-
-# 5. Static Files Serving
-# This lets you go to http://localhost:8000/content/thumbnails/your_image.jpg
-app.mount("/content/photos", StaticFiles(directory="/app/data/photos"), name="photos")
-app.mount("/content/thumbs", StaticFiles(directory="/app/data/thumbnails"), name="thumbnails")
-app.mount("/content/faces", StaticFiles(directory="/app/data/faces"), name="faces")
 
 @app.get("/people")
 def get_people_gallery():
-    """Returns a list of all detected face crops."""
-    with Session(engine) as session:
-        faces = session.exec(select(Face)).all()
-        return [
-            {
-                "face_id": f.id,
-                "photo_id": f.photo_id,
-                "url": f"/content/faces/face_{f.id}.jpg"
-            }
-            for f in faces
-        ]
-    
+    try:
+        with Session(engine) as session:
+            people = []
+            persons = session.exec(select(Person)).all()
+
+            for person in persons:
+                face = session.exec(select(Face).where(Face.person_id == person.id).limit(1)).first()
+                if not face:
+                    continue
+                people.append({
+                    "person_id": person.id,
+                    "name": person.name,
+                    "face_id": face.id,
+                    "photo_id": face.photo_id,
+                    "url": f"content/faces/face_{face.id}.jpg"
+                })
+
+            unassigned_faces = session.exec(select(Face).where(Face.person_id == None)).all()
+            for face in unassigned_faces:
+                people.append({
+                    "person_id": None,
+                    "name": "Unknown",
+                    "face_id": face.id,
+                    "photo_id": face.photo_id,
+                    "url": f"content/faces/face_{face.id}.jpg"
+                })
+
+            return people
+    except Exception as e:
+        print(f"Error in /people endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/people/{person_id}")
+def update_person_name(person_id: int, update: PersonNameUpdate):
+    try:
+        with Session(engine) as session:
+            person = session.get(Person, person_id)
+            if not person:
+                raise HTTPException(status_code=404, detail="Person not found")
+
+            person.name = update.name.strip() or "Unknown"
+            session.add(person)
+            session.commit()
+            return {"person_id": person.id, "name": person.name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating person name: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/gallery")
 def get_gallery():
     with Session(engine) as session:
-        from sqlmodel import select
-        # Only show photos that are successfully processed
         statement = select(Photo).where(Photo.status == "processed")
         photos = session.exec(statement).all()
-        
-        # We transform the data to include the URL for the frontend
         return [
             {
                 "id": p.id,
@@ -127,11 +164,8 @@ def get_gallery():
             }
             for p in photos
         ]
-    
+
 @app.get("/faces")
 def get_faces():
     with Session(engine) as session:
-        from sqlmodel import select
-        # This queries the Face table we created
-        faces = session.exec(select(Face)).all()
-        return faces
+        return session.exec(select(Face)).all()
